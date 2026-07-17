@@ -192,6 +192,94 @@ def one_hot_encode(df, cols):
     return pd.get_dummies(df, columns=valid, drop_first=True)
 
 
+def mask_pii_hash(series, salt):
+    import hashlib
+
+    def _h(v):
+        if pd.isna(v):
+            return v
+        return hashlib.sha256((salt + str(v)).encode("utf-8")).hexdigest()[:12]
+    return series.map(_h)
+
+
+def mask_pii_sequential(series):
+    uniq = list(pd.Series(series.dropna().unique()))
+    mapping = {v: f"ID_{i + 1:04d}" for i, v in enumerate(uniq)}
+    return series.map(mapping)
+
+
+def filter_by_date_range(df, col, start, end):
+    """dfをcolがstart〜end(両端含む)の範囲に絞り込む。日付として解釈できない行は除外される"""
+    parsed = pd.to_datetime(df[col], errors="coerce")
+    mask = (parsed >= pd.Timestamp(start)) & (parsed <= pd.Timestamp(end))
+    return df[mask].reset_index(drop=True), int(mask.sum())
+
+
+def label_encode_columns(df, cols):
+    """カテゴリカラムをラベルエンコーディング（{col}_le を追加）"""
+    df = df.copy()
+    messages = []
+    for c in cols:
+        if c in df.columns:
+            codes, _ = pd.factorize(df[c])
+            df[f"{c}_le"] = codes
+            messages.append(f"{c} → {c}_le")
+    return df, messages
+
+
+def bin_column(df, col, bins=4):
+    """数値カラムを等頻度でビン分割（{col}_bin を追加）"""
+    df = df.copy()
+    df[f"{col}_bin"] = pd.qcut(df[col], q=bins, duplicates="drop").astype(str)
+    return df
+
+
+def standardize_columns(df, cols):
+    """数値カラムを標準化（{col}_z を追加）"""
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            std = df[c].std()
+            df[f"{c}_z"] = (df[c] - df[c].mean()) / std if std and std > 0 else 0.0
+    return df
+
+
+def add_interaction_feature(df, col_a, col_b):
+    """2つの数値カラムの掛け算で交互作用特徴量を作成（{colA}_x_{colB} を追加）"""
+    df = df.copy()
+    df[f"{col_a}_x_{col_b}"] = pd.to_numeric(df[col_a], errors="coerce") * pd.to_numeric(df[col_b], errors="coerce")
+    return df
+
+
+def log_transform_columns(df, cols):
+    """右に裾が長い数値カラムを対数変換（{col}_log を追加）"""
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[f"{c}_log"] = np.log1p(pd.to_numeric(df[c], errors="coerce").clip(lower=0))
+    return df
+
+
+def run_kmeans(df, cols, n_clusters=3, scale=True, random_state=42):
+    """指定カラムでK-meansクラスタリングを実行し、クラスタ番号のSeriesを返す"""
+    from sklearn.cluster import KMeans
+
+    work = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(work) < n_clusters:
+        return {"error": f"有効なデータが{len(work)}件しかなく、グループ数({n_clusters})より少ないため実行できません"}
+
+    if scale:
+        from sklearn.preprocessing import StandardScaler
+        X = StandardScaler().fit_transform(work)
+    else:
+        X = work.values
+
+    model = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    labels = model.fit_predict(X)
+    label_series = pd.Series(labels, index=work.index, name="cluster")
+    return {"labels": label_series, "inertia": float(model.inertia_), "index": work.index}
+
+
 def correlation_matrix(df):
     return df.select_dtypes(include="number").corr(numeric_only=True)
 
@@ -231,6 +319,135 @@ def run_chi2(df, col_a, col_b):
     ct = pd.crosstab(df[col_a], df[col_b])
     chi2, p_val, dof, _ = stats.chi2_contingency(ct)
     return {"crosstab": ct, "chi2": chi2, "dof": dof, "p": p_val}
+
+
+def partial_correlation_matrix(df, cols):
+    """相関行列の逆行列（精度行列）から偏相関係数を計算する。
+    偏相関＝他の全変数の影響を差し引いた上での、2変数間の相関。"""
+    sub = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(sub) < len(cols) + 2:
+        return None
+    corr = sub.corr().values
+    try:
+        inv_corr = np.linalg.pinv(corr)
+    except np.linalg.LinAlgError:
+        return None
+    d = np.sqrt(np.diag(inv_corr))
+    if np.any(d == 0):
+        return None
+    pcorr = -inv_corr / np.outer(d, d)
+    np.fill_diagonal(pcorr, 1.0)
+    return pd.DataFrame(pcorr, index=sub.columns, columns=sub.columns)
+
+
+def bayesian_linear_regression(X, y, prior_scale=10.0, a0=0.001, b0=0.001):
+    """正規事前分布 + 逆ガンマ事前分布による閉形式ベイズ線形回帰。
+    Xは標準化済みを想定。切片項を自動で追加する。
+    戻り値: [切片, 特徴量1, 特徴量2, ...] の順でcoef/se/信用区間を持つ辞書のリスト"""
+    from scipy import stats as sstats
+
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n, p = X.shape
+    X_design = np.column_stack([np.ones(n), X])
+    k = p + 1
+
+    Lambda0 = np.eye(k) / (prior_scale ** 2)
+    beta0 = np.zeros(k)
+
+    XtX = X_design.T @ X_design
+    Lambda_n = XtX + Lambda0
+    Lambda_n_inv = np.linalg.inv(Lambda_n)
+    beta_n = Lambda_n_inv @ (Lambda0 @ beta0 + X_design.T @ y)
+
+    an = a0 + n / 2
+    bn = b0 + 0.5 * (y @ y + beta0 @ Lambda0 @ beta0 - beta_n @ Lambda_n @ beta_n)
+
+    scale_matrix = (bn / an) * Lambda_n_inv
+    dof = 2 * an
+    se = np.sqrt(np.clip(np.diag(scale_matrix), 0, None))
+    t_crit = sstats.t.ppf(0.975, dof)
+
+    results = []
+    for j in range(k):
+        results.append({
+            "coef": float(beta_n[j]),
+            "se": float(se[j]),
+            "ci_lower": float(beta_n[j] - t_crit * se[j]),
+            "ci_upper": float(beta_n[j] + t_crit * se[j]),
+        })
+    return results
+
+
+def bayesian_group_diff(group_a, group_b, n_samples=20000, random_state=42):
+    """2群の平均の差について、共役事前分布 + モンテカルロサンプリングでベイズ推定する"""
+    rng = np.random.default_rng(random_state)
+
+    def sample_posterior_mean(data):
+        data = np.asarray(data, dtype=float)
+        n = len(data)
+        mean = data.mean()
+        a0, b0 = 0.001, 0.001
+        an = a0 + n / 2
+        var = data.var(ddof=1) if n > 1 else 1.0
+        bn = b0 + 0.5 * (n - 1) * var
+        sigma2_samples = 1 / rng.gamma(shape=an, scale=1 / bn, size=n_samples)
+        mu_samples = rng.normal(loc=mean, scale=np.sqrt(sigma2_samples / n))
+        return mu_samples
+
+    samples_a = sample_posterior_mean(group_a)
+    samples_b = sample_posterior_mean(group_b)
+    diff = samples_a - samples_b
+    ci_lower, ci_upper = np.percentile(diff, [2.5, 97.5])
+    return {
+        "prob_a_gt_b": float((diff > 0).mean()),
+        "diff_mean": float(diff.mean()),
+        "ci_lower": float(ci_lower),
+        "ci_upper": float(ci_upper),
+    }
+
+
+def bottleneck_analysis(df, target, factors):
+    """各要因について、単純相関・偏相関・ベイズ回帰係数(信用区間つき)を算出し、
+    「本当に効いていそうな要因」を偏相関の絶対値順にランキングする。
+    因果関係を証明するものではなく、統計的な関連の強さを多角的に比較するもの。"""
+    sub = df[[target] + factors].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(sub) < len(factors) + 5:
+        return {"error": f"有効なデータが{len(sub)}件と少なすぎます（要因数+5件以上が目安です）"}
+
+    std = sub.std(ddof=0)
+    if (std == 0).any():
+        zero_cols = std[std == 0].index.tolist()
+        return {"error": f"値が一定で分散が無いカラムが含まれています: {', '.join(zero_cols)}"}
+
+    standardized = (sub - sub.mean()) / std
+    y = standardized[target].values
+    X = standardized[factors].values
+
+    simple_corr = {f: float(standardized[f].corr(standardized[target])) for f in factors}
+
+    pcorr_matrix = partial_correlation_matrix(standardized, [target] + factors)
+    if pcorr_matrix is not None:
+        partial_corr = {f: float(pcorr_matrix.loc[target, f]) for f in factors}
+    else:
+        partial_corr = {f: None for f in factors}
+
+    bayes_results = bayesian_linear_regression(X, y, prior_scale=10.0)
+
+    rows = []
+    for i, f in enumerate(factors):
+        b = bayes_results[i + 1]
+        sc, pc = simple_corr[f], partial_corr[f]
+        gap = (abs(sc) - abs(pc)) if pc is not None else None
+        rows.append({
+            "要因": f, "単純相関": sc, "偏相関": pc,
+            "標準化回帰係数": b["coef"], "係数_信用区間下限": b["ci_lower"], "係数_信用区間上限": b["ci_upper"],
+            "相関の差(見せかけ度)": gap,
+        })
+    table = pd.DataFrame(rows)
+    sort_key = table["偏相関"].abs() if pcorr_matrix is not None else table["単純相関"].abs()
+    table = table.iloc[sort_key.sort_values(ascending=False).index].reset_index(drop=True)
+    return {"table": table, "n": len(sub)}
 
 
 def recommend_algorithm(n_rows):
@@ -521,9 +738,40 @@ with st.expander("💴 3. 数値クリーニング（円・カンマなどの文
             st.info("対象カラムを選んでください")
 
 # ============================================================
-# 4. 不要カラムの削除
+# 4. 個人情報のマスク
 # ============================================================
-with st.expander("🗑️ 4. 不要カラムの削除", expanded=False):
+with st.expander("🕵️ 4. 個人情報のマスク", expanded=False):
+    st.caption("氏名・メールアドレスなどをハッシュ化または連番IDに置き換えます。同じ値は必ず同じ結果になるので、集計・結合には使えます。")
+    pii_cols = st.multiselect("対象カラム", options=list(df.columns), key="pii_cols")
+    pii_method = st.radio("方法", ["ハッシュ化 (SHA-256)", "連番ID (ID_0001形式)"], key="pii_method")
+    pii_salt = ""
+    if pii_method == "ハッシュ化 (SHA-256)":
+        if "pii_auto_salt" not in st.session_state:
+            import secrets
+            st.session_state.pii_auto_salt = secrets.token_hex(8)
+        pii_salt = st.text_input("ソルト（空欄なら自動生成された値を使用）",
+                                  value="", placeholder=st.session_state.pii_auto_salt, key="pii_salt")
+        if not pii_salt:
+            pii_salt = st.session_state.pii_auto_salt
+
+    if st.button("マスクを適用", key="btn_pii"):
+        if pii_cols:
+            new_df = df.copy()
+            for c in pii_cols:
+                if pii_method == "ハッシュ化 (SHA-256)":
+                    new_df[c] = mask_pii_hash(new_df[c], pii_salt)
+                else:
+                    new_df[c] = mask_pii_sequential(new_df[c])
+            st.session_state.df = new_df
+            st.success(f"{len(pii_cols)}カラムをマスクしました")
+            _rerun()
+        else:
+            st.info("対象カラムを選んでください")
+
+# ============================================================
+# 5. 不要カラムの削除
+# ============================================================
+with st.expander("🗑️ 5. 不要カラムの削除", expanded=False):
     drop_cols = st.multiselect("削除するカラム", options=list(df.columns), key="drop_cols")
     if st.button("削除を適用", key="btn_drop"):
         if drop_cols:
@@ -534,9 +782,9 @@ with st.expander("🗑️ 4. 不要カラムの削除", expanded=False):
             st.info("削除するカラムを選んでください")
 
 # ============================================================
-# 5. 欠損値・外れ値
+# 6. 欠損値・外れ値・日付範囲
 # ============================================================
-with st.expander("🧹 5. 欠損値・外れ値の処理", expanded=False):
+with st.expander("🧹 6. 欠損値・外れ値・日付範囲の処理", expanded=False):
     st.subheader("欠損値")
     missing_col_options = list(missing_summary(df).index)
     missing_target_cols = st.multiselect("対象カラム（空欄なら欠損のある全カラム）",
@@ -581,10 +829,31 @@ with st.expander("🧹 5. 欠損値・外れ値の処理", expanded=False):
         st.success(f"下位{outlier_pct}% / 上位{outlier_pct}%を外れ値としてクリッピングしました")
         _rerun()
 
+    st.subheader("日付で絞り込む")
+    date_filter_col = st.selectbox("対象の日付カラム", options=["(選択しない)"] + list(df.columns), key="date_filter_col")
+    if date_filter_col != "(選択しない)":
+        parsed_for_filter = pd.to_datetime(df[date_filter_col], errors="coerce")
+        valid_dates = parsed_for_filter.dropna()
+        if len(valid_dates) > 0:
+            min_d, max_d = valid_dates.min().date(), valid_dates.max().date()
+            date_range = st.date_input("期間（開始日〜終了日）", value=(min_d, max_d),
+                                        min_value=min_d, max_value=max_d, key="date_range")
+            if st.button("日付で絞り込みを適用", key="btn_date_filter"):
+                if isinstance(date_range, tuple) and len(date_range) == 2:
+                    start, end = date_range
+                    new_df, n_kept = filter_by_date_range(df, date_filter_col, start, end)
+                    st.session_state.df = new_df
+                    st.success(f"{start} 〜 {end} の範囲に絞り込みました（{n_kept}件が残りました）")
+                    _rerun()
+                else:
+                    st.info("開始日と終了日の両方を選んでください")
+        else:
+            st.warning("この列を日付として解釈できませんでした")
+
 # ============================================================
-# 6. 特徴量エンジニアリング
+# 7. 特徴量エンジニアリング
 # ============================================================
-with st.expander("🛠️ 6. 特徴量エンジニアリング", expanded=False):
+with st.expander("🛠️ 7. 特徴量エンジニアリング", expanded=False):
     st.subheader("日付分解 (年・月・日・曜日・週末フラグ)")
     date_col = st.selectbox("対象カラム", options=["(選択しない)"] + list(df.columns), key="date_col")
     if st.button("日付分解を適用", key="btn_datefeat"):
@@ -625,6 +894,67 @@ with st.expander("🛠️ 6. 特徴量エンジニアリング", expanded=False)
         else:
             st.info("対象カラムを選んでください")
 
+    st.subheader("ラベルエンコーディング")
+    st.caption("文字列を整数コードに変換します（決定木系モデル向け）")
+    label_cols = st.multiselect("対象カラム", options=cat_cols_options, key="fe_label_cols")
+    if st.button("ラベルエンコーディングを適用", key="btn_label"):
+        if label_cols:
+            new_df, msgs = label_encode_columns(df, label_cols)
+            st.session_state.df = new_df
+            for m in msgs:
+                st.write("- " + m)
+            _rerun()
+        else:
+            st.info("対象カラムを選んでください")
+
+    st.subheader("ビニング（数値を等頻度で分割）")
+    bin_col_options = ["(選択しない)"] + list(df.select_dtypes(include="number").columns)
+    bin_col = st.selectbox("対象カラム", options=bin_col_options, key="fe_bin_col")
+    bin_count = st.slider("分割数", min_value=2, max_value=10, value=4, key="fe_bin_count")
+    if st.button("ビニングを適用", key="btn_bin"):
+        if bin_col != "(選択しない)":
+            try:
+                st.session_state.df = bin_column(df, bin_col, bins=bin_count)
+                st.success(f"{bin_col} を{bin_count}分割し、{bin_col}_bin を追加しました")
+                _rerun()
+            except ValueError as e:
+                st.error(f"分割できませんでした（同じ値が多すぎる可能性があります）: {e}")
+        else:
+            st.info("対象カラムを選んでください")
+
+    st.subheader("標準化")
+    st.caption("(x - 平均) / 標準偏差 に変換します。空欄なら数値カラム全体が対象です")
+    scale_cols_fe = st.multiselect("対象カラム（空欄で数値カラム全体）",
+                                    options=list(df.select_dtypes(include="number").columns), key="fe_scale_cols")
+    if st.button("標準化を適用", key="btn_scale_fe"):
+        target = scale_cols_fe if scale_cols_fe else list(df.select_dtypes(include="number").columns)
+        st.session_state.df = standardize_columns(df, target)
+        st.success(f"{len(target)}カラムを標準化しました")
+        _rerun()
+
+    st.subheader("交互作用特徴量")
+    numeric_cols_fe = list(df.select_dtypes(include="number").columns)
+    inter_a = st.selectbox("カラムA", options=["(選択しない)"] + numeric_cols_fe, key="fe_inter_a")
+    inter_b = st.selectbox("カラムB", options=["(選択しない)"] + numeric_cols_fe, key="fe_inter_b")
+    if st.button("交互作用特徴量を作成", key="btn_inter"):
+        if inter_a != "(選択しない)" and inter_b != "(選択しない)" and inter_a != inter_b:
+            st.session_state.df = add_interaction_feature(df, inter_a, inter_b)
+            st.success(f"{inter_a}_x_{inter_b} を追加しました")
+            _rerun()
+        else:
+            st.info("異なる2つのカラムを選んでください")
+
+    st.subheader("対数変換")
+    st.caption("右に裾が長い分布（金額・件数など）の是正に使えます")
+    log_cols = st.multiselect("対象カラム", options=list(df.select_dtypes(include="number").columns), key="fe_log_cols")
+    if st.button("対数変換を適用", key="btn_log"):
+        if log_cols:
+            st.session_state.df = log_transform_columns(df, log_cols)
+            st.success(f"{len(log_cols)}カラムを対数変換しました")
+            _rerun()
+        else:
+            st.info("対象カラムを選んでください")
+
     st.subheader("カスタム特徴量 (Pandasコード)")
     st.caption("⚠️ ここに入力したコードはそのまま実行されます。信頼できる自分のコードのみ入力してください。")
     feat_code = st.text_area("例: df['単価'] = df['売上'] / df['数量']", key="feat_code", height=80)
@@ -642,9 +972,9 @@ with st.expander("🛠️ 6. 特徴量エンジニアリング", expanded=False)
             st.info("コードを入力してください")
 
 # ============================================================
-# 7. 可視化
+# 8. 可視化
 # ============================================================
-with st.expander("📊 7. 可視化", expanded=False):
+with st.expander("📊 8. 可視化", expanded=False):
     numeric_cols = list(df.select_dtypes(include="number").columns)
     cat_cols_for_viz = list(df.select_dtypes(include=["object", "string", "category"]).columns)
     viz_tab_hist, viz_tab_box, viz_tab_scatter, viz_tab_heatmap = st.tabs(
@@ -711,11 +1041,11 @@ with st.expander("📊 7. 可視化", expanded=False):
             st.info("数値カラムが2つ未満のため、相関・ヒートマップは計算できません")
 
 # ============================================================
-# 8. 統計検定
+# 9. 統計検定
 # ============================================================
-with st.expander("🧪 8. 統計検定", expanded=False):
+with st.expander("🧪 9. 統計検定", expanded=False):
     test_type = st.selectbox("検定手法", ["実行しない", "t検定 (2群の平均の差)", "Mann-Whitney U検定",
-                                        "カイ二乗検定 (独立性)"], key="test_type")
+                                        "カイ二乗検定 (独立性)", "ベイズ推定 (2群の平均の差)"], key="test_type")
     col_a = st.selectbox("比較する群のカラム", options=list(df.columns), key="test_col_a")
     col_b = st.selectbox("対象カラム (数値 or カテゴリ)", options=list(df.columns), key="test_col_b")
     if st.button("検定を実行", key="btn_test"):
@@ -755,13 +1085,128 @@ with st.expander("🧪 8. 統計検定", expanded=False):
                 st.success("2つのカラムには統計的に有意な関連があります (p < 0.05)")
             else:
                 st.info("有意な関連は確認できませんでした (p >= 0.05)")
+        elif test_type == "ベイズ推定 (2群の平均の差)":
+            levels = list(df[col_a].dropna().unique())
+            if len(levels) < 2:
+                st.error(f"グループが2つ未満のため実行できません: {col_a}")
+            else:
+                if len(levels) > 2:
+                    st.warning(f"グループが3つ以上のため先頭の2グループで比較します -> {levels[0]} / {levels[1]}")
+                g1 = pd.to_numeric(df.loc[df[col_a] == levels[0], col_b], errors="coerce").dropna()
+                g2 = pd.to_numeric(df.loc[df[col_a] == levels[1], col_b], errors="coerce").dropna()
+                bres = bayesian_group_diff(g1, g2)
+                st.write(f"**{levels[0]} の平均が {levels[1]} より高い確率: {bres['prob_a_gt_b']:.1%}**")
+                st.write(f"平均の差 ({levels[0]} − {levels[1]}): {bres['diff_mean']:.2f}")
+                st.write(f"95%信用区間: [{bres['ci_lower']:.2f}, {bres['ci_upper']:.2f}]")
+                p = bres["prob_a_gt_b"]
+                if p > 0.95 or p < 0.05:
+                    st.success("非常に高い確率で差があると言えます")
+                elif p > 0.90 or p < 0.10:
+                    st.info("差がある可能性が高いですが、断定はできません")
+                else:
+                    st.info("差があるとは言い切れません")
+                st.caption("p値の代わりに「Aの方が高い確率」を直接示すのがベイズ推定の特徴です。")
         else:
             st.info("検定手法を選んでください")
 
 # ============================================================
-# 9. 機械学習 + SHAP
+# 10. ボトルネック分析（相関・偏相関・ベイズ推定）
 # ============================================================
-with st.expander("🤖 9. 機械学習 + SHAP要因分析", expanded=False):
+with st.expander("🔬 10. ボトルネック分析（相関・偏相関・ベイズ推定）", expanded=False):
+    st.caption("「何が結果を左右しているか」を、単純な相関だけでなく、他の要因の影響を差し引いた"
+               "**偏相関**や、不確実性を示す**ベイズ信用区間**つきで比較します。")
+    st.warning("⚠️ これは統計的な関連の強さを比較するものであり、因果関係を証明するものではありません。"
+               "また偏相関は、ここで選んだ要因どうしの関係を調整するだけで、"
+               "分析に含めていない別の隠れた要因の影響までは取り除けません。")
+
+    numeric_cols_bn = list(df.select_dtypes(include="number").columns)
+    bn_target = st.selectbox("結果（ボトルネックを探したい変数）", options=numeric_cols_bn, key="bn_target")
+    bn_factor_candidates = [c for c in numeric_cols_bn if c != bn_target]
+    bn_factors = st.multiselect("候補となる要因（2つ以上選んでください）", options=bn_factor_candidates, key="bn_factors")
+
+    if st.button("ボトルネック分析を実行", key="btn_bottleneck"):
+        if len(bn_factors) < 2:
+            st.info("要因を2つ以上選んでください（偏相関の計算に必要です）")
+        else:
+            bn_result = bottleneck_analysis(df, bn_target, bn_factors)
+            if "error" in bn_result:
+                st.error(bn_result["error"])
+            else:
+                st.caption(f"有効データ: {bn_result['n']}件")
+                display_table = bn_result["table"].copy()
+                num_cols_disp = ["単純相関", "偏相関", "標準化回帰係数",
+                                  "係数_信用区間下限", "係数_信用区間上限", "相関の差(見せかけ度)"]
+                display_table[num_cols_disp] = display_table[num_cols_disp].round(3)
+                st.dataframe(display_table, use_container_width=True)
+
+                top = bn_result["table"].iloc[0]
+                st.success(f"**最有力候補: {top['要因']}**（偏相関 {top['偏相関']:.3f}、"
+                           f"標準化係数の95%信用区間 [{top['係数_信用区間下限']:.3f}, {top['係数_信用区間上限']:.3f}]）")
+
+                suspicious = bn_result["table"][bn_result["table"]["相関の差(見せかけ度)"] > 0.2]
+                if len(suspicious) > 0:
+                    st.warning("⚠️ 以下は単純相関が高い一方、他の要因を考慮すると関連が弱まりました。"
+                               "見せかけの相関（他の要因を介した間接的な関係）の可能性があります: "
+                               + "、".join(suspicious["要因"].tolist()))
+
+# ============================================================
+# 11. クラスタリング (グループ分け)
+# ============================================================
+with st.expander("🧭 11. クラスタリング（似たものどうしをグループ分け）", expanded=False):
+    st.caption("目的変数を決めずに、似たデータどうしを自動でグループ分けします（教師なし学習）。")
+    cluster_cols = st.multiselect("グループ分けに使うカラム（数値のみ、2つ以上推奨）",
+                                   options=list(df.select_dtypes(include="number").columns), key="cluster_cols")
+    n_clusters = st.slider("グループ数", min_value=2, max_value=10, value=3, key="cluster_n")
+    cluster_scale = st.checkbox("標準化してから実行する（おすすめ・スケールの違う項目を混ぜるときは特に重要）",
+                                 value=True, key="cluster_scale")
+
+    if st.button("クラスタリングを実行", key="btn_cluster"):
+        if len(cluster_cols) < 1:
+            st.info("カラムを1つ以上選んでください")
+        else:
+            cluster_result = run_kmeans(df, cluster_cols, n_clusters=n_clusters, scale=cluster_scale)
+            if "error" in cluster_result:
+                st.error(cluster_result["error"])
+            else:
+                new_df = df.copy()
+                new_df["cluster"] = pd.NA
+                new_df.loc[cluster_result["index"], "cluster"] = cluster_result["labels"].values
+                st.session_state.df = new_df
+                st.session_state.cluster_cols_used = cluster_cols
+                st.success(f"{n_clusters}グループに分け、「cluster」カラムを追加しました")
+                _rerun()
+
+    if "cluster" in df.columns and st.session_state.get("cluster_cols_used"):
+        st.markdown("---")
+        st.write("**各グループの件数**")
+        st.dataframe(df["cluster"].value_counts().sort_index().rename("件数"), use_container_width=True)
+
+        used_cols = [c for c in st.session_state.cluster_cols_used if c in df.columns]
+        plot_rows = df.dropna(subset=["cluster"] + used_cols)
+        if len(used_cols) >= 2 and len(plot_rows) > 0:
+            import matplotlib.pyplot as plt
+            if len(used_cols) == 2:
+                plot_x, plot_y = plot_rows[used_cols[0]], plot_rows[used_cols[1]]
+                xlabel, ylabel = used_cols[0], used_cols[1]
+            else:
+                from sklearn.decomposition import PCA
+                coords = PCA(n_components=2).fit_transform(plot_rows[used_cols])
+                plot_x, plot_y = coords[:, 0], coords[:, 1]
+                xlabel, ylabel = "主成分1 (PC1)", "主成分2 (PC2)"
+            fig, ax = plt.subplots(figsize=(7, 5))
+            scatter = ax.scatter(plot_x, plot_y, c=plot_rows["cluster"].astype(int), cmap="tab10", alpha=0.7)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"クラスタリング結果 ({n_clusters}グループ)")
+            legend1 = ax.legend(*scatter.legend_elements(), title="グループ")
+            ax.add_artist(legend1)
+            st.pyplot(fig)
+            plt.close(fig)
+
+# ============================================================
+# 12. 機械学習 + SHAP
+# ============================================================
+with st.expander("🤖 12. 機械学習 + SHAP要因分析", expanded=False):
     target = st.selectbox("目的変数", options=list(df.columns), key="ml_target")
 
     n_for_target = int(df[target].dropna().shape[0])
@@ -840,9 +1285,9 @@ with st.expander("🤖 9. 機械学習 + SHAP要因分析", expanded=False):
                 st.error(f"SHAP計算中にエラーが発生しました: {e}")
 
 # ============================================================
-# 10. ダウンロード
+# 13. ダウンロード
 # ============================================================
-st.header("10. ダウンロード")
+st.header("13. ダウンロード")
 csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
 st.download_button("📥 現在のデータをCSVでダウンロード", data=csv_bytes,
                     file_name="cleaned_data.csv", mime="text/csv")
