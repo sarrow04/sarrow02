@@ -111,7 +111,8 @@ def apply_column_types(df, column_types):
         if t == "str":
             df[col] = df[col].astype("string")
         elif t == "int":
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+            # 小数を含む値をそのままInt64にキャストするとTypeErrorになるため、四捨五入してから変換する
+            df[col] = pd.to_numeric(df[col], errors="coerce").round().astype("Int64")
         elif t == "float":
             df[col] = pd.to_numeric(df[col], errors="coerce")
         elif t == "date":
