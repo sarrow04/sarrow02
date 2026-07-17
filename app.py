@@ -14,6 +14,34 @@ import streamlit as st
 st.set_page_config(page_title="データ探偵事務所 分析アプリ", layout="wide")
 
 
+def setup_japanese_font():
+    """グラフの日本語文字化けをできる限り防ぐ（一度だけ呼び出す）"""
+    try:
+        import japanize_matplotlib  # noqa: F401  最も手軽で確実な方法
+        return "japanize_matplotlib"
+    except ImportError:
+        pass
+
+    import matplotlib
+    import matplotlib.font_manager as fm
+
+    candidates = [
+        "Noto Sans CJK JP", "Noto Sans JP", "IPAexGothic", "IPAGothic",
+        "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", "YuGothic",
+        "Meiryo", "TakaoPGothic", "MS Gothic",
+    ]
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            matplotlib.rcParams["font.family"] = name
+            matplotlib.rcParams["axes.unicode_minus"] = False
+            return name
+    return None
+
+
+_JP_FONT = setup_japanese_font()
+
+
 def _rerun():
     """Streamlitのバージョン差異を吸収する再実行ヘルパー"""
     if hasattr(st, "rerun"):
@@ -93,11 +121,26 @@ def apply_column_types(df, column_types):
     return df
 
 
-def fill_missing(df, method):
+def fill_missing(df, method, cols=None, fill_value=None):
+    """method: 'median'|'mean'|'constant'|'ffill'|'bfill'|'dropna'
+    cols: 対象カラムを限定する場合に指定（Noneなら全カラム対象）"""
     df = df.copy()
+    target_cols = [c for c in (cols if cols else df.columns) if c in df.columns]
+
     if method == "dropna":
-        return df.dropna()
-    for col in df.columns:
+        return df.dropna(subset=target_cols) if cols else df.dropna()
+    if method == "ffill":
+        df[target_cols] = df[target_cols].ffill()
+        return df
+    if method == "bfill":
+        df[target_cols] = df[target_cols].bfill()
+        return df
+    if method == "constant":
+        for col in target_cols:
+            df[col] = df[col].fillna(fill_value)
+        return df
+
+    for col in target_cols:
         if df[col].isnull().any():
             if pd.api.types.is_numeric_dtype(df[col]):
                 fill_val = df[col].median() if method == "median" else df[col].mean()
@@ -108,15 +151,16 @@ def fill_missing(df, method):
     return df
 
 
-def clip_outliers(df, cols=None):
+def clip_outliers(df, cols=None, lower_pct=0.01, upper_pct=0.99):
+    """lower_pct/upper_pct: クリップする分位点（例: 0.01/0.99 で下位1%・上位1%をクリップ）"""
     df = df.copy()
     target_cols = cols if cols else list(df.select_dtypes(include="number").columns)
     for col in target_cols:
         if col not in df.columns:
             continue
         s = pd.to_numeric(df[col], errors="coerce").astype("float64")
-        lower = s.quantile(0.01)
-        upper = s.quantile(0.99)
+        lower = s.quantile(lower_pct)
+        upper = s.quantile(upper_pct)
         df[col] = s.clip(lower=lower, upper=upper)
     return df
 
@@ -494,22 +538,47 @@ with st.expander("🗑️ 4. 不要カラムの削除", expanded=False):
 # ============================================================
 with st.expander("🧹 5. 欠損値・外れ値の処理", expanded=False):
     st.subheader("欠損値")
-    fillna_method = st.radio("方法", ["数値は中央値・カテゴリは最頻値", "数値は平均値・カテゴリは最頻値", "欠損を含む行を削除"],
-                              key="fillna_method")
-    method_map = {"数値は中央値・カテゴリは最頻値": "median", "数値は平均値・カテゴリは最頻値": "mean",
-                  "欠損を含む行を削除": "dropna"}
+    missing_col_options = list(missing_summary(df).index)
+    missing_target_cols = st.multiselect("対象カラム（空欄なら欠損のある全カラム）",
+                                          options=missing_col_options, key="missing_cols")
+    fillna_method = st.radio("方法", [
+        "数値は中央値・カテゴリは最頻値", "数値は平均値・カテゴリは最頻値",
+        "指定した値で埋める", "前の行の値で埋める (ffill)", "後の行の値で埋める (bfill)",
+        "欠損を含む行を削除",
+    ], key="fillna_method")
+    method_map = {
+        "数値は中央値・カテゴリは最頻値": "median", "数値は平均値・カテゴリは最頻値": "mean",
+        "指定した値で埋める": "constant", "前の行の値で埋める (ffill)": "ffill",
+        "後の行の値で埋める (bfill)": "bfill", "欠損を含む行を削除": "dropna",
+    }
+    fill_value_input = None
+    if fillna_method == "指定した値で埋める":
+        fill_value_input = st.text_input("埋める値（数値カラムは数字として解釈されます）", key="fillna_value")
+
     if st.button("欠損値処理を適用", key="btn_fillna"):
-        st.session_state.df = fill_missing(df, method_map[fillna_method])
+        method_code = method_map[fillna_method]
+        value_to_use = fill_value_input
+        if method_code == "constant" and fill_value_input is not None:
+            try:
+                value_to_use = float(fill_value_input) if "." in fill_value_input else int(fill_value_input)
+            except ValueError:
+                value_to_use = fill_value_input  # 数値に変換できなければ文字列のまま埋める
+        st.session_state.df = fill_missing(df, method_code,
+                                            cols=missing_target_cols if missing_target_cols else None,
+                                            fill_value=value_to_use)
         st.success("欠損値処理を適用しました")
         _rerun()
 
-    st.subheader("外れ値クリッピング (1%-99%)")
+    st.subheader("外れ値クリッピング")
+    outlier_pct = st.slider("外れ値とみなす範囲（下位・上位それぞれ何%をクリップするか）",
+                             min_value=0.5, max_value=10.0, value=1.0, step=0.5, key="outlier_pct")
     outlier_cols = st.multiselect("対象カラム（空欄で数値カラム全体）",
                                    options=list(df.select_dtypes(include="number").columns),
                                    key="outlier_cols")
     if st.button("外れ値クリッピングを適用", key="btn_outlier"):
-        st.session_state.df = clip_outliers(df, cols=outlier_cols if outlier_cols else None)
-        st.success("外れ値をクリッピングしました")
+        st.session_state.df = clip_outliers(df, cols=outlier_cols if outlier_cols else None,
+                                             lower_pct=outlier_pct / 100, upper_pct=1 - outlier_pct / 100)
+        st.success(f"下位{outlier_pct}% / 上位{outlier_pct}%を外れ値としてクリッピングしました")
         _rerun()
 
 # ============================================================
@@ -585,10 +654,6 @@ with st.expander("📊 7. 可視化", expanded=False):
         if numeric_cols:
             hist_col = st.selectbox("対象カラム", options=numeric_cols, key="hist_col")
             import matplotlib.pyplot as plt
-            try:
-                import japanize_matplotlib  # noqa: F401
-            except ImportError:
-                pass
             fig, ax = plt.subplots(figsize=(7, 4))
             df[hist_col].dropna().astype(float).plot.hist(bins=30, ax=ax, edgecolor="black", color="#16213e")
             ax.set_title(f"分布: {hist_col}")
@@ -604,10 +669,6 @@ with st.expander("📊 7. 可視化", expanded=False):
             box_group = st.selectbox("グループ分け（任意）", options=["(グループなし)"] + cat_cols_for_viz, key="box_group")
             import matplotlib.pyplot as plt
             import seaborn as sns
-            try:
-                import japanize_matplotlib  # noqa: F401
-            except ImportError:
-                pass
             fig, ax = plt.subplots(figsize=(7, 4))
             if box_group != "(グループなし)":
                 sns.boxplot(data=df, x=box_group, y=box_val, ax=ax, color="skyblue")
@@ -625,10 +686,6 @@ with st.expander("📊 7. 可視化", expanded=False):
             scatter_x = st.selectbox("X軸", options=numeric_cols, key="scatter_x")
             scatter_y = st.selectbox("Y軸", options=numeric_cols, index=min(1, len(numeric_cols) - 1), key="scatter_y")
             import matplotlib.pyplot as plt
-            try:
-                import japanize_matplotlib  # noqa: F401
-            except ImportError:
-                pass
             fig, ax = plt.subplots(figsize=(7, 4))
             ax.scatter(df[scatter_x], df[scatter_y], alpha=0.6, color="#16213e")
             ax.set_xlabel(scatter_x)
@@ -645,10 +702,6 @@ with st.expander("📊 7. 可視化", expanded=False):
             st.dataframe(corr.round(3), use_container_width=True)
             import matplotlib.pyplot as plt
             import seaborn as sns
-            try:
-                import japanize_matplotlib  # noqa: F401
-            except ImportError:
-                pass
             fig, ax = plt.subplots(figsize=(7, 5))
             sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdBu_r", vmin=-1, vmax=1, ax=ax)
             ax.set_title("相関ヒートマップ")
@@ -777,10 +830,6 @@ with st.expander("🤖 9. 機械学習 + SHAP要因分析", expanded=False):
                                                    st.session_state.trained_algo, st.session_state.trained_task)
                 import matplotlib.pyplot as plt
                 import shap
-                try:
-                    import japanize_matplotlib  # noqa: F401
-                except ImportError:
-                    pass
                 fig = plt.figure(figsize=(8, 6))
                 shap.summary_plot(shap_values, result["X_test"], show=False)
                 st.pyplot(fig)
