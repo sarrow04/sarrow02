@@ -6,7 +6,9 @@ scikit-learn
 matplotlib
 seaborn
 openpyxl
-# 以下は任意（入っていれば自動で使われます）
+# 以下の3つは「LightGBM」「SHAP要因分析」「グラフの日本語フォント」を使うためのものです。
+# このファイルに残しておけば pip install -r requirements.txt / Streamlit Cloudへのデプロイ時に
+# 自動でインストールされます（何もしなくてOK）。使わないなら削除しても動作します。
 shap
 lightgbm
 japanize-matplotlib
