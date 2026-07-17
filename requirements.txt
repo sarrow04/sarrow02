@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+scipy
+scikit-learn
+matplotlib
+seaborn
+openpyxl
+# 以下は任意（入っていれば自動で使われます）
+shap
+lightgbm
+japanize-matplotlib
