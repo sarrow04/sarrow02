@@ -495,10 +495,73 @@ with st.expander("🛠️ 6. 特徴量エンジニアリング", expanded=False)
             st.info("コードを入力してください")
 
 # ============================================================
-# 7. 相関係数・ヒートマップ
+# 7. 可視化
 # ============================================================
-with st.expander("📊 7. 相関係数・ヒートマップ", expanded=False):
-    if st.button("相関を計算", key="btn_corr"):
+with st.expander("📊 7. 可視化", expanded=False):
+    numeric_cols = list(df.select_dtypes(include="number").columns)
+    cat_cols_for_viz = list(df.select_dtypes(include=["object", "string", "category"]).columns)
+    viz_tab_hist, viz_tab_box, viz_tab_scatter, viz_tab_heatmap = st.tabs(
+        ["ヒストグラム", "箱ひげ図", "散布図", "相関ヒートマップ"])
+
+    with viz_tab_hist:
+        if numeric_cols:
+            hist_col = st.selectbox("対象カラム", options=numeric_cols, key="hist_col")
+            import matplotlib.pyplot as plt
+            try:
+                import japanize_matplotlib  # noqa: F401
+            except ImportError:
+                pass
+            fig, ax = plt.subplots(figsize=(7, 4))
+            df[hist_col].dropna().astype(float).plot.hist(bins=30, ax=ax, edgecolor="black", color="#16213e")
+            ax.set_title(f"分布: {hist_col}")
+            ax.set_xlabel(hist_col)
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("数値カラムがありません")
+
+    with viz_tab_box:
+        if numeric_cols:
+            box_val = st.selectbox("数値カラム", options=numeric_cols, key="box_val")
+            box_group = st.selectbox("グループ分け（任意）", options=["(グループなし)"] + cat_cols_for_viz, key="box_group")
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            try:
+                import japanize_matplotlib  # noqa: F401
+            except ImportError:
+                pass
+            fig, ax = plt.subplots(figsize=(7, 4))
+            if box_group != "(グループなし)":
+                sns.boxplot(data=df, x=box_group, y=box_val, ax=ax, color="skyblue")
+                ax.set_title(f"箱ひげ図: {box_val} ({box_group}別)")
+            else:
+                sns.boxplot(y=df[box_val].dropna().astype(float), ax=ax, color="skyblue")
+                ax.set_title(f"箱ひげ図: {box_val}")
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("数値カラムがありません")
+
+    with viz_tab_scatter:
+        if len(numeric_cols) >= 2:
+            scatter_x = st.selectbox("X軸", options=numeric_cols, key="scatter_x")
+            scatter_y = st.selectbox("Y軸", options=numeric_cols, index=min(1, len(numeric_cols) - 1), key="scatter_y")
+            import matplotlib.pyplot as plt
+            try:
+                import japanize_matplotlib  # noqa: F401
+            except ImportError:
+                pass
+            fig, ax = plt.subplots(figsize=(7, 4))
+            ax.scatter(df[scatter_x], df[scatter_y], alpha=0.6, color="#16213e")
+            ax.set_xlabel(scatter_x)
+            ax.set_ylabel(scatter_y)
+            ax.set_title(f"散布図: {scatter_x} x {scatter_y}")
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("数値カラムが2つ未満のため散布図は表示できません")
+
+    with viz_tab_heatmap:
         corr = correlation_matrix(df)
         if len(corr.columns) > 1:
             st.dataframe(corr.round(3), use_container_width=True)
@@ -512,6 +575,7 @@ with st.expander("📊 7. 相関係数・ヒートマップ", expanded=False):
             sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdBu_r", vmin=-1, vmax=1, ax=ax)
             ax.set_title("相関ヒートマップ")
             st.pyplot(fig)
+            plt.close(fig)
         else:
             st.info("数値カラムが2つ未満のため、相関・ヒートマップは計算できません")
 
