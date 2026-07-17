@@ -675,7 +675,8 @@ c1, c2 = st.columns(2)
 c1.metric("行数", len(df))
 c2.metric("列数", len(df.columns))
 
-tab_head, tab_tail, tab_info, tab_missing = st.tabs(["先頭5行", "末尾5行", "データ型", "欠損値"])
+tab_head, tab_tail, tab_info, tab_missing, tab_cat = st.tabs(
+    ["先頭5行", "末尾5行", "データ型", "欠損値", "文字列カラムの中身"])
 with tab_head:
     st.dataframe(df.head(), use_container_width=True)
 with tab_tail:
@@ -688,6 +689,20 @@ with tab_missing:
         st.dataframe(ms, use_container_width=True)
     else:
         st.success("欠損値はありません")
+with tab_cat:
+    cat_cols_preview = list(df.select_dtypes(include=["object", "string", "category"]).columns)
+    if cat_cols_preview:
+        cat_preview_col = st.selectbox("対象カラム", options=cat_cols_preview, key="cat_preview_col")
+        n_unique = df[cat_preview_col].nunique(dropna=True)
+        n_missing_cat = df[cat_preview_col].isna().sum()
+        st.write(f"種類の数: **{n_unique}種類**" + (f"（欠損 {n_missing_cat}件）" if n_missing_cat > 0 else ""))
+        vc = df[cat_preview_col].value_counts(dropna=False).rename("件数")
+        st.dataframe(vc, use_container_width=True)
+        st.bar_chart(vc.head(20))
+        if n_unique > 20:
+            st.caption(f"グラフは件数の多い上位20種類のみ表示しています（全{n_unique}種類）")
+    else:
+        st.info("文字列・カテゴリのカラムがありません")
 
 id_like = identify_id_like_columns(df)
 if id_like:
@@ -1120,9 +1135,26 @@ with st.expander("🔬 10. ボトルネック分析（相関・偏相関・ベ�
                "分析に含めていない別の隠れた要因の影響までは取り除けません。")
 
     numeric_cols_bn = list(df.select_dtypes(include="number").columns)
-    bn_target = st.selectbox("結果（ボトルネックを探したい変数）", options=numeric_cols_bn, key="bn_target")
-    bn_factor_candidates = [c for c in numeric_cols_bn if c != bn_target]
-    bn_factors = st.multiselect("候補となる要因（2つ以上選んでください）", options=bn_factor_candidates, key="bn_factors")
+    non_numeric_bn = [c for c in df.columns if c not in numeric_cols_bn]
+
+    if len(numeric_cols_bn) < 3:
+        st.error(
+            f"数値として認識されているカラムが{len(numeric_cols_bn)}個しかありません"
+            "（結果1つ＋要因2つ以上、合計3個以上が必要です）。\n\n"
+            "**本当は数値のはずのカラムが文字列として読み込まれている可能性があります。**"
+            "「2. カラムの型変換」で対象カラムを「整数」または「小数」に変換するか、"
+            "「3. 数値クリーニング」で単位や記号を除去してから、もう一度お試しください。"
+        )
+        if non_numeric_bn:
+            st.caption("現在、数値として認識されていないカラム: " + "、".join(non_numeric_bn))
+        st.dataframe(df.dtypes.astype(str).rename("dtype"), use_container_width=True)
+
+    if len(numeric_cols_bn) >= 1:
+        bn_target = st.selectbox("結果（ボトルネックを探したい変数）", options=numeric_cols_bn, key="bn_target")
+        bn_factor_candidates = [c for c in numeric_cols_bn if c != bn_target]
+        bn_factors = st.multiselect("候補となる要因（2つ以上選んでください）", options=bn_factor_candidates, key="bn_factors")
+    else:
+        bn_target, bn_factors = None, []
 
     if st.button("ボトルネック分析を実行", key="btn_bottleneck"):
         if len(bn_factors) < 2:
