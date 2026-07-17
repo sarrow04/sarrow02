@@ -189,6 +189,82 @@ def run_chi2(df, col_a, col_b):
     return {"crosstab": ct, "chi2": chi2, "dof": dof, "p": p_val}
 
 
+def recommend_algorithm(n_rows):
+    """データ件数に応じたおすすめアルゴリズムを返す（あくまで目安）"""
+    try:
+        import lightgbm  # noqa: F401
+        lgbm_available = True
+    except ImportError:
+        lgbm_available = False
+
+    if n_rows < 50:
+        return {"algo": "lr",
+                "label": "線形/ロジスティック回帰",
+                "reason": f"データが{n_rows}件と少なめです。複雑なモデルは少ないデータで過学習しやすいため、"
+                          "まずはシンプルな線形/ロジスティック回帰がおすすめです。"}
+    if n_rows < 300:
+        return {"algo": "dt",
+                "label": "決定木",
+                "reason": f"データが{n_rows}件です。決定木のようなシンプルなモデルが扱いやすくおすすめです。"}
+    if n_rows < 2000:
+        return {"algo": "rf",
+                "label": "ランダムフォレスト",
+                "reason": f"データが{n_rows}件あります。複数の木を組み合わせるランダムフォレストがバランス良くおすすめです。"}
+    if lgbm_available:
+        return {"algo": "lgbm",
+                "label": "LightGBM",
+                "reason": f"データが{n_rows}件と十分にあります。LightGBMのような高精度なモデルの効果を発揮しやすいデータ量です。"}
+    return {"algo": "hgb",
+            "label": "勾配ブースティング (sklearn)",
+            "reason": f"データが{n_rows}件と十分にあります。sklearn内蔵の勾配ブースティングがおすすめです"
+                      "（lightgbmを追加インストールすると、さらに精度が上がる場合があります）。"}
+
+
+def judge_regression_metrics(metrics, y_test):
+    """回帰の指標が良いか悪いかを日本語で判定する"""
+    r2 = metrics["R2"]
+    if r2 >= 0.7:
+        r2_judge = "とても良い当てはまりです"
+    elif r2 >= 0.5:
+        r2_judge = "まずまず良い当てはまりです"
+    elif r2 >= 0.2:
+        r2_judge = "当てはまりはやや弱めです"
+    elif r2 >= 0:
+        r2_judge = "ほとんど説明できていません"
+    else:
+        r2_judge = "平均値で予測するより悪い結果です（見直しをおすすめします）"
+
+    y_std = float(pd.Series(y_test).std())
+    if not y_std or y_std <= 0:
+        mae_ratio, mae_judge = None, "目的変数にばらつきが無いため判定できません"
+    else:
+        mae_ratio = metrics["MAE"] / y_std
+        if mae_ratio < 0.5:
+            mae_judge = "誤差は比較的小さめです"
+        elif mae_ratio < 1.0:
+            mae_judge = "誤差はまずまずの大きさです"
+        else:
+            mae_judge = "誤差が大きく、予測はあまり当てになりません"
+
+    return {"r2_judge": r2_judge, "mae_ratio": mae_ratio, "mae_judge": mae_judge}
+
+
+def judge_classification_metrics(metrics, y_test):
+    """分類の精度が良いか悪いかを、多数派予測との比較で判定する"""
+    baseline = float(pd.Series(y_test).value_counts(normalize=True).max())
+    acc = metrics["Accuracy"]
+    diff = acc - baseline
+    if diff >= 0.20:
+        judge = "とても良い精度です（多数派をそのまま予測する場合より大きく上回っています）"
+    elif diff >= 0.10:
+        judge = "まずまず良い精度です"
+    elif diff >= 0.03:
+        judge = "多少の改善はありますが、大きな差ではありません"
+    else:
+        judge = "多数派を予測するのとほとんど変わりません。特徴量やモデルの見直しをおすすめします"
+    return {"baseline": baseline, "diff": diff, "judge": judge}
+
+
 def build_model(task, algo, random_state=42):
     if algo == "lgbm":
         import lightgbm as lgb
@@ -254,9 +330,11 @@ def train_and_evaluate(df, target, features, task, algo, use_dummies=False, scal
             "RMSE": float(np.sqrt(mean_squared_error(y_test, pred))),
             "R2": r2_score(y_test, pred),
         }
+        result["judge"] = judge_regression_metrics(result["metrics"], y_test)
     else:
         result["metrics"] = {"Accuracy": accuracy_score(y_test, pred)}
         result["report"] = classification_report(y_test, pred, zero_division=0)
+        result["judge"] = judge_classification_metrics(result["metrics"], y_test)
     return result
 
 
@@ -632,22 +710,33 @@ with st.expander("🧪 8. 統計検定", expanded=False):
 # ============================================================
 with st.expander("🤖 9. 機械学習 + SHAP要因分析", expanded=False):
     target = st.selectbox("目的変数", options=list(df.columns), key="ml_target")
+
+    n_for_target = int(df[target].dropna().shape[0])
+    recommendation = recommend_algorithm(n_for_target)
+    st.info(f"📌 データ量からのおすすめ: **{recommendation['label']}**\n\n{recommendation['reason']}")
+
     feature_candidates = [c for c in df.columns if c != target]
     features = st.multiselect("特徴量 (空欄なら目的変数以外の数値カラム全て)", options=feature_candidates, key="ml_features")
     task = st.radio("タスク", ["回帰 (数値予測)", "分類 (カテゴリ予測)"], key="ml_task")
     task_code = "reg" if task.startswith("回帰") else "clf"
-    algo_label = st.selectbox("アルゴリズム", ["線形/ロジスティック回帰", "決定木", "ランダムフォレスト",
-                                          "勾配ブースティング (sklearn)", "LightGBM (要インストール)"], key="ml_algo")
-    algo_map = {"線形/ロジスティック回帰": "lr", "決定木": "dt", "ランダムフォレスト": "rf",
-                "勾配ブースティング (sklearn)": "hgb", "LightGBM (要インストール)": "lgbm"}
-    algo_code = algo_map[algo_label]
+
+    algo_labels = ["線形/ロジスティック回帰", "決定木", "ランダムフォレスト",
+                   "勾配ブースティング (sklearn)", "LightGBM (要インストール)"]
+    algo_codes = ["lr", "dt", "rf", "hgb", "lgbm"]
+    default_index = algo_codes.index(recommendation["algo"]) if recommendation["algo"] in algo_codes else 0
+    algo_label = st.selectbox("アルゴリズム", algo_labels, index=default_index, key="ml_algo")
+    algo_code = algo_codes[algo_labels.index(algo_label)]
+
     use_dummies = st.checkbox("カテゴリ変数をダミー変数化して特徴量に含める", key="ml_dummies")
     scale = st.checkbox("特徴量を標準化する (線形回帰系で推奨)", key="ml_scale")
+    test_size_pct = st.slider("テストデータの割合 (残りを学習に使います)", min_value=10, max_value=50,
+                               value=30, step=5, key="ml_test_size")
 
     if st.button("モデルを学習", key="btn_train"):
         try:
             result = train_and_evaluate(df, target, features, task_code, algo_code,
-                                         use_dummies=use_dummies, scale=scale)
+                                         use_dummies=use_dummies, scale=scale,
+                                         test_size=test_size_pct / 100)
             if "error" in result:
                 st.error(result["error"])
                 st.session_state.trained = None
@@ -655,9 +744,21 @@ with st.expander("🤖 9. 機械学習 + SHAP要因分析", expanded=False):
                 st.session_state.trained = result
                 st.session_state.trained_algo = algo_code
                 st.session_state.trained_task = task_code
+                st.caption(f"🔀 学習データ {len(result['X_train'])}件 / テストデータ {len(result['X_test'])}件 に分割"
+                           "（精度はモデルが学習中に見ていないテストデータだけで計算しています）")
                 st.subheader("モデル精度")
-                st.json(result["metrics"])
-                if task_code == "clf":
+                m, j = result["metrics"], result["judge"]
+                if task_code == "reg":
+                    st.write(f"**R2 (決定係数): {m['R2']:.3f}** — {j['r2_judge']}")
+                    if j["mae_ratio"] is not None:
+                        st.write(f"**MAE (平均絶対誤差): {m['MAE']:.2f}** — {j['mae_judge']}"
+                                 f"（目的変数のばらつきの約{j['mae_ratio'] * 100:.0f}%）")
+                    else:
+                        st.write(f"**MAE (平均絶対誤差): {m['MAE']:.2f}**")
+                    st.write(f"**RMSE: {m['RMSE']:.2f}**")
+                else:
+                    st.write(f"**Accuracy (正解率): {m['Accuracy']:.1%}** — {j['judge']}")
+                    st.caption(f"（何も考えずに一番多いクラスだけを予測した場合の正解率: {j['baseline']:.1%}）")
                     st.text(result["report"])
         except ImportError as e:
             st.error(f"必要なライブラリが見つかりません: {e}")
@@ -665,6 +766,7 @@ with st.expander("🤖 9. 機械学習 + SHAP要因分析", expanded=False):
         except Exception as e:
             st.error(f"学習中にエラーが発生しました: {e}")
             st.session_state.trained = None
+
 
     if st.session_state.trained is not None:
         st.markdown("---")
